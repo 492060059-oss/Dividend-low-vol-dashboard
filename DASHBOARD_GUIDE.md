@@ -117,3 +117,28 @@ python build_dashboard.py                    # 重新生成本目录 index.html
 - workflow 运行日志在仓库 Actions 页；若 csindex 当日数据发布晚于 22:00，
   次日首次运行会自动补上（脚本是增量追加，不怕跳天）。
 - 512890 分红除权日（通常每年 1 月）后，前复权全序列变化属正常现象。
+
+
+---
+
+2026-10-30 补充：上线五步（GitHub Pages）
+=============================================
+
+本目录已是独立 git 仓库（首次提交已完成）。看板只依赖 index.html + plotly.min.js
+两个静态文件，GitHub Pages 免费托管即可，不需要 Render 也能用。
+
+1. 浏览器登录 GitHub → 右上角 + → New repository →
+   名字如 `hongli-dashboard`，选 Public，**不要**勾选任何初始化文件 → Create。
+2. 新仓库页绿色 **Code** 按钮 → **SSH** 标签 → 复制整条地址。
+3. 在本文件夹打开 Git Bash（右键 → Open Git Bash Here），执行：
+       git remote add origin <粘贴刚复制的 SSH 地址>
+       git remote -v        ← 必看核对，必须是 git@github.com:... 形式
+       git push -u origin main
+4. 仓库页 → Settings → Pages → Branch 选 `main` + `/ (root)` → Save。
+5. 等 1~2 分钟，访问 `https://492060059-oss.github.io/<仓库名>/`。
+
+**日常更新**：主项目 `git pull` 拿最新数据 → 本目录 `python build_dashboard.py`
+→ `git add -A && git commit -m "数据更新至x月x日" && git push`，Pages 一分钟后自动刷新。
+
+本地图形版：双击 index.html 即可（plotly.min.js 同目录离线加载）；
+实时版仍可 `python dashboard_app.py`（Render 部署见下文历史章节）。
