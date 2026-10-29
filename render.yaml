@@ -1,0 +1,12 @@
+# Render.com 部署蓝图（免费实例）
+# 用法：把仓库推到 GitHub 后，Render 控制台 New -> Web Service 连接该仓库，
+# Render 会读取本文件自动完成配置；也可按下述字段手动填写。
+services:
+  - type: web
+    name: hongli-lowvol-dashboard      # 服务名，决定网址前缀 xxx.onrender.com
+    runtime: python
+    plan: free                          # 免费实例（闲置15分钟后休眠，首次访问约需30~60秒唤醒）
+    region: singapore                   # 离大陆最近的可用区
+    buildCommand: pip install -r requirements-dashboard.txt
+    startCommand: python dashboard_app.py
+    autoDeploy: false                   # 页面是实时渲染的，数据不依赖重新部署；避免每日数据提交触发无谓重建
