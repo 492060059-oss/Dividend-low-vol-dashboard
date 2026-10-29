@@ -2,16 +2,24 @@
 """
 每日指标看板生成器（手机友好，交互式 HTML，供 GitHub Pages 发布）
 
-2026-10-30 交互版：
-  · 单标的 H20269 红利低波全收益指数（策略阈值与历史检验均在它上面标定；
-    512890 与其走势一致但含打新增厚，不再单独展示）；
-  · 价格与均线 / 年线乖离率 / RSI 三张图全部输出全历史数据，
-    支持顶部按钮（近1年/2年/5年/全部）与拖拽缩放，三图 x 轴同步联动；
-  · 「跌破年线」区间改为红色底纹 + 图例条目说明，不再使用图内文字标注。
+2026-10-30 交互版 v2（前端评审 P0 修复）：
+  · 单标的 H20269 红利低波全收益指数（策略阈值与历史检验均在它上面标定）；
+  · 图表改为客户端 JS 绘制：数据只内嵌一份，三图 x 轴共享同一数组；
+    顶部时间范围按钮（近3月/1年/2年/5年/全部，带激活态）+ 拖拽/双指/滚轮缩放，
+    三图 x 轴同步联动，y 轴按可见窗口自动收紧（纵轴固定为派生量，手势只作用于时间轴）；
+  · 触屏：拖动=平移（不再与页面滚动语义冲突），双击图表=复位当前视图；
+  · 「跌破年线」红底纹按数据区段绘制（yref=paper 全高），图例条目为纯说明、
+    点击不会隐藏底纹（plotly_legendclick 返回 false 拦截）；
+  · 乖离率图 y 轴自适应时自动并入邻近的策略阈值线（卖50%/清仓线不再凭空消失）；
+  · 数据过期自检：数据日期落后查看日 ≥4 天时，页首红条提醒重新构建；
+  · 窄屏（≤620px）图例自动移到图表下方，不再遮挡曲线；标题改用 HTML 标签不再截断；
+  · 体积：plotly-basic 精简包（~1.1MB）替代全量包（4.5MB），数据数组只存一份。
+每日重建由 .github/workflows/update-page.yml 自动完成（拉主仓库数据→重建→提交，
+Pages 随仓库刷新），人工只需在改了图表代码时才需要本地构建。
 
-读取：data/H20269历史数据.csv（主项目 data/，中证官网 API 维护，只追加）
-输出：index.html（写入本目录）—— 静态快照，双击可看；发布见 DASHBOARD_GUIDE.md
-用法：python build_dashboard.py（建议先在主项目 git pull 拿到最新数据）
+读取：主项目 data/H20269历史数据.csv（中证官网 API 维护，只追加）
+输出：index.html（写入本目录）
+用法：python build_dashboard.py
 """
 # === 数据源定位（副项目版） ===
 import os as _os
@@ -25,18 +33,25 @@ if _os.path.abspath(_os.getcwd()) != _ROOT:
     _os.chdir(_ROOT)
 # === /数据源定位 ===
 
+import json
 import sys
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
-import plotly.graph_objects as go
 
 OUT_PATH = _os.path.join(_HERE, 'index.html')
 
-# plotly.min.js 本地优先（GitHub Pages 同源加载最稳），缺失时退回 CDN
-_PLOTLY_LOCAL = _os.path.join(_HERE, 'plotly.min.js')
-PLOTLY_JS = './plotly.min.js' if _os.path.exists(_PLOTLY_LOCAL) else \
-    'https://cdn.plot.ly/plotly-2.35.2.min.js'
+
+def _pick_plotly():
+    """客户端图表库：优先本地精简包（basic ~1.1MB，覆盖 scatter/shapes/图例全部所需），
+    缺失时退回本地全量包 / CDN。"""
+    for name in ('plotly-basic.min.js', 'plotly.min.js'):
+        if _os.path.exists(_os.path.join(_HERE, name)):
+            return './' + name
+    return 'https://cdn.plot.ly/plotly-basic-2.35.2.min.js'
+
+
+PLOTLY_JS = _pick_plotly()
 
 # 策略/信号阈值（与 core/rolling_position_backtest.py 及 docs/ROLLING_POSITION_STRATEGY.md 对齐）
 TIER3, TIER2 = -8.0, -4.0        # 深度定投 3×/2× 触发线（乖离率%）
@@ -116,111 +131,25 @@ def zone_of(bias):
     return '触发清仓线', 'zclear'
 
 
-# ------------------------------------------------------------- 图表 ----
-# 三张图共用同一份全历史 x 轴（MA250/RSI 均有效的区间），保证联动缩放严格对齐。
-
-_CFG = {'responsive': True, 'displayModeBar': False, 'scrollZoom': True}
-
+# ------------------------------------------------------------- 数据序列 ----
 
 def _below_segments(d):
-    """收盘跌破 MA250 的连续区间 [(起始日, 结束日), ...]。"""
+    """收盘跌破 MA250 的连续区段 [(起索引, 止索引), ...]（闭区间、相对 d 的行号）。"""
     below = (d['收盘'] < d['MA250']).values
-    segs, in_seg, start = [], False, None
+    segs, in_seg, start = [], False, 0
     for i in range(len(d)):
         if below[i] and not in_seg:
             in_seg, start = True, i
         if in_seg and (not below[i] or i == len(d) - 1):
-            end = i if below[i] else i - 1
-            segs.append((d['日期'].iloc[start], d['日期'].iloc[end]))
+            segs.append([start, i if below[i] else i - 1])
             in_seg = False
     return segs
 
 
-def _dates(d):
-    return d['日期'].dt.strftime('%Y-%m-%d').tolist()
-
-
 def _js_arr(s):
-    """Series → JS 数组字面量（NaN 直接写作 NaN，浏览器端可解析）。"""
+    """数值 Series → JS 数组字面量；NaN 写作 null（图表断点，纵轴拟合时跳过）。"""
     vals = [None if v != v else round(float(v), 2) for v in s]
     return '[' + ','.join('null' if v is None else repr(v) for v in vals) + ']'
-
-
-def _tail_range(d, cols, n, pad, include_zero=False):
-    """末 n 行各列的最小/最大值（y 轴初始可见范围）。"""
-    tail = d.tail(n)
-    vals = pd.concat([tail[c] for c in cols]).dropna()
-    lo, hi = float(vals.min()), float(vals.max())
-    span = (hi - lo) or abs(hi) or 1.0
-    lo, hi = lo - span * pad, hi + span * pad
-    if include_zero:
-        lo = min(lo, 0.0)
-    return [lo, hi]
-
-
-def fig_price(d, initial_n):
-    x = _dates(d)
-    fig = go.Figure()
-    fig.add_scatter(x=x, y=d['收盘'].round(2), name='收盘',
-                    line=dict(color='#1f77b4', width=1.8))
-    for col, color, width in [('MA20', '#ff7f0e', 1.1), ('MA60', '#2ca02c', 1.1),
-                              ('MA250', '#d62728', 1.6)]:
-        fig.add_scatter(x=x, y=d[col].round(2), name=col,
-                        line=dict(color=color, width=width))
-    # 跌破年线 → 纯色底纹（不加图内文字），含义由图例条目说明
-    for s, e in _below_segments(d):
-        fig.add_vrect(x0=s, x1=e, fillcolor='rgba(200,60,60,0.12)',
-                      line_width=0, layer='below')
-    fig.add_scatter(x=[None], y=[None], mode='lines', hoverinfo='skip',
-                    name='跌破年线区间（红底纹）',
-                    line=dict(color='rgba(200,60,60,0.5)', width=10))
-    fig.update_layout(title='价格与均线 · H20269 红利低波全收益指数',
-                      height=400, margin=dict(l=46, r=16, t=46, b=28),
-                      legend=dict(orientation='h', y=1.06, x=0, font_size=10),
-                      hovermode='x unified', xaxis_range=[x[-initial_n], x[-1]],
-                      yaxis_range=_tail_range(d, ['收盘', 'MA20', 'MA60', 'MA250'],
-                                              initial_n, 0.06))
-    fig.update_yaxes(tickformat=',.0f')
-    return fig.to_html(full_html=False, include_plotlyjs=False,
-                       div_id='c_price', config=_CFG)
-
-
-def fig_bias(d, initial_n):
-    x = _dates(d)
-    fig = go.Figure()
-    fig.add_scatter(x=x, y=d['乖离率'].round(2), name='年线乖离率%',
-                    line=dict(color='#636efa', width=1.5), fill='tozeroy',
-                    fillcolor='rgba(99,110,250,0.10)')
-    for y, color, text in [(TIER3, '#2980b9', '3×定投'), (TIER2, '#5dade2', '2×定投'),
-                           (0, '#7f8c8d', '年线'), (WATCH, '#f39c12', '止盈观察'),
-                           (SELL_A, '#e67e22', '卖50%'), (SELL_B, '#c0392b', '清仓')]:
-        fig.add_hline(y=y, line_dash='dot', line_color=color, line_width=1,
-                      annotation_text=text, annotation_font_size=9,
-                      annotation_font_color=color, annotation_position='right')
-    fig.update_layout(title='年线乖离率（收盘相对 MA250）',
-                      height=300, margin=dict(l=46, r=52, t=46, b=28),
-                      showlegend=False, hovermode='x unified',
-                      xaxis_range=[x[-initial_n], x[-1]],
-                      yaxis_range=_tail_range(d, ['乖离率'], initial_n, 0.12, True))
-    return fig.to_html(full_html=False, include_plotlyjs=False,
-                       div_id='c_bias', config=_CFG)
-
-
-def fig_rsi(d, initial_n):
-    x = _dates(d)
-    fig = go.Figure()
-    for col, color in [('RSI6', '#e74c3c'), ('RSI12', '#27ae60'), ('RSI24', '#8e44ad')]:
-        fig.add_scatter(x=x, y=d[col].round(1), name=col,
-                        line=dict(color=color, width=1.3))
-    fig.add_hline(y=30, line_dash='dot', line_color='#7f8c8d', line_width=1)
-    fig.add_hline(y=70, line_dash='dot', line_color='#7f8c8d', line_width=1)
-    fig.update_layout(title='RSI（Wilder 平滑，30/70 参考线）',
-                      height=280, margin=dict(l=46, r=16, t=46, b=28),
-                      legend=dict(orientation='h', y=1.08, x=0, font_size=10),
-                      hovermode='x unified', yaxis_range=[0, 100],
-                      xaxis_range=[x[-initial_n], x[-1]])
-    return fig.to_html(full_html=False, include_plotlyjs=False,
-                       div_id='c_rsi', config=_CFG)
 
 
 # ------------------------------------------------------------- 页面 ----
@@ -231,14 +160,17 @@ body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
        background: #f4f6f8; color: #2c3e50; padding-bottom: 40px; }
 .wrap { max-width: 860px; margin: 0 auto; padding: 14px; }
 h1 { font-size: 20px; margin: 8px 0 2px; }
-.meta { font-size: 12px; color: #7f8c8d; margin-bottom: 10px; }
+.meta { font-size: 12px; color: #5d6d7e; margin-bottom: 10px; }
+.stale { background: #fdf0ef; border-left: 4px solid #e74c3c; color: #943126;
+         font-size: 12px; line-height: 1.6; padding: 10px 12px; border-radius: 8px;
+         margin: 10px 0; }
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
          gap: 8px; margin: 10px 0; }
 .card { background: #fff; border-radius: 10px; padding: 10px 12px;
         box-shadow: 0 1px 3px rgba(0,0,0,.08); }
-.card .k { font-size: 11px; color: #95a5a6; margin-bottom: 4px; }
+.card .k { font-size: 11px; color: #5d6d7e; margin-bottom: 4px; }
 .card .v { font-size: 19px; font-weight: 600; }
-.card .v small { font-size: 11px; color: #95a5a6; font-weight: normal; }
+.card .v small { font-size: 11px; color: #5d6d7e; font-weight: normal; }
 .badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 10px;
          color: #fff; margin-top: 4px; }
 .z3x{background:#21618c}.z2x{background:#2e86c1}.zbelow{background:#ca8a04}
@@ -250,38 +182,53 @@ h1 { font-size: 20px; margin: 8px 0 2px; }
   font-size: 15px; color: #2c3e50; }
 .zonebar .cur { position: absolute; top: 22px; transform: translateX(-50%);
   font-size: 11px; color: #2c3e50; white-space: nowrap; font-weight: 600; }
-.zonebar .tick { position: absolute; top: 16px; font-size: 9px; color: #7f8c8d;
+.zonebar .tick { position: absolute; top: 16px; font-size: 9px; color: #5d6d7e;
   transform: translateX(-50%); }
-.sig { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+.sig { display: grid; grid-template-columns: repeat(auto-fit, minmax(158px, 1fr));
        gap: 8px; margin: 10px 0 4px; }
 .sigcard { background: #fff; border-radius: 10px; padding: 9px 12px;
            box-shadow: 0 1px 3px rgba(0,0,0,.08); border-left: 4px solid #bdc3c7; }
 .sigcard.active { border-left-color: #e74c3c; background: #fdf0ef; }
 .sigcard.warm { border-left-color: #f39c12; background: #fef9f0; }
-.sigcard .t { font-size: 12px; font-weight: 600; }
-.sigcard .d { font-size: 11px; color: #7f8c8d; margin-top: 3px; }
+.sigcard .row { display: flex; justify-content: space-between; align-items: center;
+                gap: 6px; }
+.sigcard .t { font-size: 12px; font-weight: 600; display: flex; align-items: center;
+              white-space: nowrap; }
+.sigcard .chip { font-size: 10px; padding: 1px 7px; border-radius: 9px; color: #fff;
+                 background: #95a5a6; white-space: nowrap; flex: none; }
+.chip.active { background: #e74c3c; }
+.chip.warm { background: #f39c12; }
+.sigcard .d { font-size: 11px; color: #5d6d7e; margin-top: 4px;
+              font-variant-numeric: tabular-nums; }
+.sigcard .d b { color: #2c3e50; font-weight: 600; }
 .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%;
-       margin-right: 5px; background: #bdc3c7; }
+       margin-right: 5px; background: #bdc3c7; flex: none; }
 .active .dot { background: #e74c3c; animation: blink 1.2s infinite; }
 .warm .dot { background: #f39c12; }
 @keyframes blink { 50% { opacity: .35; } }
 .rgbtns { display: flex; gap: 6px; margin: 14px 0 2px; flex-wrap: wrap;
           align-items: center; }
-.rgbtns .lab { font-size: 12px; color: #7f8c8d; margin-right: 2px; }
+.rgbtns .lab { font-size: 12px; color: #5d6d7e; margin-right: 2px; }
 .rgbtns button { font-size: 12px; padding: 5px 12px; border: 1px solid #d0d7de;
   background: #fff; border-radius: 16px; cursor: pointer; color: #2c3e50; }
 .rgbtns button:active { background: #eef2f6; }
-.chart { background: #fff; border-radius: 10px; padding: 6px 4px; margin: 10px 0;
+.rgbtns button.active { background: #2c3e50; color: #fff; border-color: #2c3e50; }
+.rgbtns button:focus-visible { outline: 2px solid #2c3e50; outline-offset: 1px; }
+.hint { font-size: 11px; color: #5d6d7e; margin: 2px 2px 4px; }
+.chart { background: #fff; border-radius: 10px; padding: 6px 4px 2px; margin: 10px 0;
          box-shadow: 0 1px 3px rgba(0,0,0,.08); }
-table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 10px;
-        overflow: hidden; font-size: 12px; margin: 10px 0;
-        box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+.chart h3 { font-size: 14px; font-weight: 600; color: #2c3e50; margin: 8px 12px 0; }
+.plot { width: 100%; }
+.tablewrap { overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 10px 0;
+             border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+table { width: 100%; border-collapse: collapse; background: #fff; font-size: 12px;
+        min-width: 520px; }
 th, td { padding: 6px 8px; text-align: right; }
 th:nth-child(1), td:nth-child(1), th:last-child, td:last-child { text-align: left; }
 th { background: #ecf0f1; font-weight: 600; }
 tr:nth-child(even) td { background: #fafbfc; }
 .pos { color: #c0392b; } .neg { color: #1e8449; }
-.foot { font-size: 12px; color: #7f8c8d; line-height: 1.7; margin-top: 20px;
+.foot { font-size: 12px; color: #5d6d7e; line-height: 1.7; margin-top: 20px;
         background: #fff; border-radius: 10px; padding: 12px 14px;
         box-shadow: 0 1px 3px rgba(0,0,0,.08); }
 .foot b { color: #2c3e50; }
@@ -290,26 +237,144 @@ tr:nth-child(even) td { background: #fafbfc; }
 ZONE_TICKS = [(TIER3, '-8'), (TIER2, '-4'), (0, '0'), (WATCH, '+4.5'),
               (SELL_A, '+15'), (SELL_B, '+17.5')]
 
+# 客户端全部图表逻辑：见 sync_js 与 init 块（数据由 assemble_html 注入
+# window.__dates / __S / __seg / __asOf，三图共享同一日期数组，零冗余）。
 SYNC_JS = """
+'use strict';
+var D = window.__dates;
+var S = window.__S;
+var T = D.map(function (s) { return Date.parse(s); });
 var IDS = ['c_price', 'c_bias', 'c_rsi'];
-var lastApply = 0;
-function __bs(arr, x) {
-  var lo = 0, hi = arr.length - 1, r = arr.length - 1;
+var lastApply = 0, btnRange = null, btnKey = null;
+var CFG = { responsive: true, displayModeBar: false, scrollZoom: true };
+var MARGIN = {
+  c_price: { l: 52, r: 14, t: 6, b: 26 },
+  c_bias:  { l: 46, r: 48, t: 6, b: 26 },
+  c_rsi:   { l: 46, r: 14, t: 6, b: 26 }
+};
+var TH = [
+  { v: -8.0, c: '#2980b9', t: '3×定投' },
+  { v: -4.0, c: '#5dade2', t: '2×定投' },
+  { v: 0,    c: '#7f8c8d', t: '年线' },
+  { v: 4.5,  c: '#f39c12', t: '止盈观察' },
+  { v: 15.0, c: '#e67e22', t: '卖50%' },
+  { v: 17.5, c: '#c0392b', t: '清仓' }
+];
+
+function toTs(v) { return typeof v === 'number' ? v : Date.parse(v); }
+function bs(x) {
+  var lo = 0, hi = T.length - 1, r = T.length - 1;
   while (lo <= hi) {
     var mid = (lo + hi) >> 1;
-    if (arr[mid] >= x) { r = mid; hi = mid - 1; } else { lo = mid + 1; }
+    if (T[mid] >= x) { r = mid; hi = mid - 1; } else { lo = mid + 1; }
   }
   return r;
 }
-function refitY(id, fit) {
-  var gd = document.getElementById(id);
-  var r = gd.layout.xaxis.range;
-  if (!r || !fit) return;
-  var i0 = __bs(fit.t, new Date(r[0]).getTime());
-  var i1 = __bs(fit.t, new Date(r[1]).getTime());
-  if (i1 <= i0) i1 = Math.min(fit.t.length - 1, i0 + 1);
+function idxRange(r) {
+  var i0 = bs(toTs(r[0])), i1 = bs(toTs(r[1]));
+  if (i1 <= i0) i1 = Math.min(T.length - 1, i0 + 1);
+  return [i0, i1];
+}
+function dateEnd() { return D[D.length - 1]; }
+function dateNDaysAgo(days) {
+  return days > 0
+    ? new Date(Date.parse(dateEnd()) - days * 86400000).toISOString().slice(0, 10)
+    : D[0];
+}
+function legendOpts() {
+  return window.innerWidth <= 620
+    ? { orientation: 'h', x: 0, xanchor: 'left', y: -0.18, yanchor: 'top', font: { size: 10 } }
+    : { orientation: 'h', x: 0, xanchor: 'left', y: 1, yanchor: 'bottom', font: { size: 11 } };
+}
+function applyLegendPos() {
+  var below = window.innerWidth <= 620;
+  IDS.forEach(function (id) {
+    var m = Object.assign({}, MARGIN[id]);
+    m.b = below ? 62 : MARGIN[id].b;
+    Plotly.relayout(document.getElementById(id), { legend: legendOpts(), margin: m });
+  });
+}
+function segShapes() {
+  return window.__seg.map(function (s) {
+    return { type: 'rect', xref: 'x', yref: 'paper', layer: 'below',
+             x0: D[s[0]], x1: D[s[1]], y0: 0, y1: 1,
+             fillcolor: 'rgba(200,60,60,0.12)', line: { width: 0 } };
+  });
+}
+var DOC = { x: [null], y: [null], mode: 'lines', hoverinfo: 'skip', isDoc: true,
+            name: '跌破年线区间（红底纹）',
+            line: { color: 'rgba(200,60,60,0.5)', width: 10 } };
+
+function buildPrice() {
+  var traces = [
+    { x: D, y: S.close, name: '收盘', mode: 'lines',
+      line: { color: '#1f77b4', width: 1.8 } },
+    { x: D, y: S.ma20, name: 'MA20', mode: 'lines',
+      line: { color: '#ff7f0e', width: 1.1 } },
+    { x: D, y: S.ma60, name: 'MA60', mode: 'lines',
+      line: { color: '#2ca02c', width: 1.1 } },
+    { x: D, y: S.ma250, name: 'MA250', mode: 'lines',
+      line: { color: '#d62728', width: 1.6 } },
+    DOC
+  ];
+  var layout = {
+    height: 400, margin: MARGIN.c_price, hovermode: 'x unified', dragmode: 'pan',
+    legend: legendOpts(),
+    xaxis: { range: [dateNDaysAgo(730), dateEnd()], doubleclick: 'false' },
+    yaxis: { tickformat: ',.0f', fixedrange: true, doubleclick: 'false' },
+    shapes: segShapes()
+  };
+  Plotly.newPlot('c_price', traces, layout, CFG);
+}
+function buildBias() {
+  var shapes = TH.map(function (o) {
+    return { type: 'line', xref: 'paper', x0: 0, x1: 1, yref: 'y',
+             y0: o.v, y1: o.v, line: { color: o.c, width: 1, dash: 'dot' },
+             layer: 'below' };
+  });
+  var annos = TH.map(function (o) {
+    return { xref: 'paper', yref: 'y', x: 1, y: o.v, xanchor: 'left',
+             yanchor: 'middle', text: o.t, font: { size: 9, color: o.c },
+             showarrow: false, xshift: 3, align: 'left' };
+  });
+  var traces = [{ x: D, y: S.bias, name: '年线乖离率%', mode: 'lines',
+                  line: { color: '#636efa', width: 1.5 }, fill: 'tozeroy',
+                  fillcolor: 'rgba(99,110,250,0.10)' }];
+  var layout = {
+    height: 300, margin: MARGIN.c_bias, hovermode: 'x unified', dragmode: 'pan',
+    showlegend: false,
+    xaxis: { range: [dateNDaysAgo(730), dateEnd()], doubleclick: 'false' },
+    yaxis: { range: [-12, 20], fixedrange: true, doubleclick: 'false' },
+    shapes: shapes, annotations: annos
+  };
+  Plotly.newPlot('c_bias', traces, layout, CFG);
+}
+function buildRsi() {
+  var traces = [
+    { x: D, y: S.rsi6, name: 'RSI6', mode: 'lines',
+      line: { color: '#e74c3c', width: 1.3 } },
+    { x: D, y: S.rsi12, name: 'RSI12', mode: 'lines',
+      line: { color: '#27ae60', width: 1.3 } },
+    { x: D, y: S.rsi24, name: 'RSI24', mode: 'lines',
+      line: { color: '#8e44ad', width: 1.3 } }
+  ];
+  var shapes = [30, 70].map(function (v) {
+    return { type: 'line', xref: 'paper', x0: 0, x1: 1, yref: 'y', y0: v, y1: v,
+             line: { color: '#7f8c8d', width: 1, dash: 'dot' }, layer: 'below' };
+  });
+  var layout = {
+    height: 280, margin: MARGIN.c_rsi, hovermode: 'x unified', dragmode: 'pan',
+    legend: legendOpts(),
+    xaxis: { range: [dateNDaysAgo(730), dateEnd()], doubleclick: 'false' },
+    yaxis: { range: [0, 100], fixedrange: true, doubleclick: 'false' },
+    shapes: shapes
+  };
+  Plotly.newPlot('c_rsi', traces, layout, CFG);
+}
+
+function fitSlice(i0, i1, arrs) {
   var mn = Infinity, mx = -Infinity;
-  fit.y.forEach(function (arr) {
+  arrs.forEach(function (arr) {
     for (var i = i0; i <= i1; i++) {
       var v = arr[i];
       if (v != null && isFinite(v)) {
@@ -318,39 +383,114 @@ function refitY(id, fit) {
       }
     }
   });
-  if (!isFinite(mn) || !isFinite(mx)) return;
-  var span = (mx - mn) || Math.abs(mx) || 1;
-  var lo = mn - span * fit.pad, hi = mx + span * fit.pad;
-  if (fit.zero) lo = Math.min(lo, 0);
-  Plotly.relayout(gd, { 'yaxis.range': [lo, hi] });
+  return isFinite(mn) ? [mn, mx] : null;
 }
-function applyAll(range) {
+function relayoutY(id, lo, hi) {
+  Plotly.relayout(document.getElementById(id), { 'yaxis.range': [lo, hi] });
+}
+function refitPrice(r) {
+  var p = fitSlice.apply(null, idxRange(r).concat([[S.close, S.ma20, S.ma60, S.ma250]]));
+  if (!p) return;
+  var span = (p[1] - p[0]) || Math.abs(p[1]) || 1;
+  relayoutY('c_price', p[0] - span * 0.06, p[1] + span * 0.06);
+}
+function refitBias(r) {
+  var p = fitSlice.apply(null, idxRange(r).concat([[S.bias]]));
+  if (!p) return;
+  var lo = p[0], hi = p[1], span = (hi - lo) || Math.abs(hi) || 1;
+  TH.forEach(function (o) {
+    if (o.v > hi && o.v - hi < span * 0.45) hi = o.v;   // 邻近阈值线并入视野
+    if (o.v < lo && lo - o.v < span * 0.45) lo = o.v;
+  });
+  span = (hi - lo) || 1;
+  relayoutY('c_bias', lo - span * 0.10, hi + span * 0.10);
+}
+function setActive(btnKey) {
+  var buttons = document.querySelectorAll('.rgbtns button[data-days]');
+  Array.prototype.forEach.call(buttons, function (b) {
+    var on = btnKey != null && b.getAttribute('data-days') === String(btnKey);
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
+}
+function applyRange(r, btnKey) {
   lastApply = Date.now();
   IDS.forEach(function (id) {
-    Plotly.relayout(document.getElementById(id), {'xaxis.range': range});
+    Plotly.relayout(document.getElementById(id), { 'xaxis.range': r });
   });
-  refitY('c_price', window.__fitPrice);
-  refitY('c_bias', window.__fitBias);
+  refitPrice(r); refitBias(r);
+  setActive(btnKey);
 }
-function setRange(days) {
-  var d = window.__dates;
-  if (!d || !d.length) return;
-  var end = d[d.length - 1];
-  var start = days > 0
-    ? new Date(new Date(end).getTime() - days * 86400000).toISOString().slice(0, 10)
-    : d[0];
-  applyAll([start, end]);
+function setRange(days, el) {
+  var r = [dateNDaysAgo(days), dateEnd()];
+  btnRange = r;                                   // 记住按钮范围，供双击复位
+  btnKey = el ? el.getAttribute('data-days') : null;
+  applyRange(r, btnKey);
 }
-IDS.forEach(function (id) {
-  var el = document.getElementById(id);
-  el.on('plotly_relayout', function (ev) {
-    if (Date.now() - lastApply < 80) return;
-    var r = ev['xaxis.range'];
-    if (!r && ev['xaxis.range[0]']) r = [ev['xaxis.range[0]'], ev['xaxis.range[1]']];
-    if (!r) return;
-    applyAll(r);
+function resetView() {
+  if (btnRange) applyRange(btnRange, btnKey);     // 回到最近一次按钮选择的范围
+  else setRange(730, document.querySelector('.rgbtns button[data-days="730"]'));
+}
+
+var readyDone = false;
+var initTries = 0;
+function bindAndStart() {
+  IDS.forEach(function (id) {
+    var el = document.getElementById(id);
+    el.on('plotly_relayout', function (ev) {
+      if (Date.now() - lastApply < 80) return;
+      var r = ev['xaxis.range'];
+      if (!r && ev['xaxis.range[0]']) r = [ev['xaxis.range[0]'], ev['xaxis.range[1]']];
+      if (!r) return;
+      // 按天取整，并夹在数据范围内（平移不越界）
+      var t0 = Math.max(toTs(r[0]), Date.parse(D[0]));
+      var t1 = Math.min(toTs(r[1]), Date.parse(dateEnd()));
+      if (t1 - t0 < 86400000) return;
+      applyRange([new Date(t0).toISOString().slice(0, 10),
+                  new Date(t1).toISOString().slice(0, 10)], null);
+    });
+    el.on('plotly_legendclick', function (pt) {
+      return pt.data && pt.data.isDoc ? false : undefined;  // 说明条目：点击不隐藏底纹
+    });
+    // 捕获阶段注册：先于 plotly 内部 dblclick 处理器，避免被 stopImmediatePropagation 吞掉
+    el.addEventListener('dblclick', resetView, true);
   });
+  setRange(730, document.querySelector('.rgbtns button[data-days="730"]'));
+  readyDone = true;
+  applyLegendPos();
+}
+// 轮询式自愈初始化：newPlot 偶发被中断时不会抛错、只是没画出来，
+// 轮询发现未画满 3 张就自动重画一次兜底，画好才绑定事件并设定初始范围。
+(function waitReady() {
+  try {
+    var plotted = document.querySelectorAll('.js-plotly-plot').length;
+    if (plotted < 3) {
+      if (++initTries === 10) { buildPrice(); buildBias(); buildRsi(); }
+      if (initTries < 60) setTimeout(waitReady, 150);
+      return;
+    }
+    bindAndStart();
+  } catch (e) {
+    if (++initTries < 60) setTimeout(waitReady, 150);
+  }
+})();
+var rzT = null;
+window.addEventListener('resize', function () {
+  clearTimeout(rzT);
+  rzT = setTimeout(function () { if (readyDone) applyLegendPos(); }, 200);
 });
+
+// 数据过期自检：数据日期落后查看日 ≥4 天时提醒重建
+(function () {
+  var days = Math.floor((Date.now() - Date.parse(window.__asOf)) / 86400000);
+  if (days >= 4) {
+    var el = document.getElementById('stale');
+    el.textContent = '⚠ 数据截至 ' + window.__asOf + '（' + days + ' 天前）。'
+      + '请在主项目仓库执行 git pull 后运行 build_dashboard.py 重新生成并推送，'
+      + '或等待看板仓库的每日自动重建。';
+    el.hidden = false;
+  }
+})();
 """
 
 
@@ -358,19 +498,17 @@ def pos_pct(bias):
     return max(0.0, min(100.0, (bias + 12.0) / 32.0 * 100))
 
 
-def section(df):
-    sig = compute_signals(df)
+def cards_html(df):
     last = df.iloc[-1]
     bias = last['乖离率']
-    zone_name, zone_cls = zone_of(bias)
-
-    cards = f"""
+    tone = 'pos' if bias >= 0 else 'neg'
+    return f"""
     <div class="cards">
       <div class="card"><div class="k">最新收盘</div>
         <div class="v">{last['收盘']:,.2f}<small> {last['日期'].strftime('%m-%d')}</small></div></div>
       <div class="card"><div class="k">年线乖离率</div>
-        <div class="v">{bias:+.2f}%</div>
-        <span class="badge {zone_cls}">{zone_name}</span></div>
+        <div class="v {tone}">{bias:+.2f}%</div>
+        <span class="badge {zone_of(bias)[1]}">{zone_of(bias)[0]}</span></div>
       <div class="card"><div class="k">RSI 6 / 12 / 24</div>
         <div class="v">{last['RSI6']:.0f}<small> / </small>{last['RSI12']:.0f}<small> / </small>{last['RSI24']:.0f}</div></div>
       <div class="card"><div class="k">距 MA20 / MA60</div>
@@ -378,28 +516,41 @@ def section(df):
         {(last['收盘']/last['MA60']-1)*100:+.1f}%</div></div>
     </div>"""
 
+
+def zonebar_html(bias):
+    p = pos_pct(bias)
     ticks = ''.join(f'<span class="tick" style="left:{pos_pct(v):.1f}%">{t}</span>'
                     for t, v in [(t, v) for v, t in ZONE_TICKS])
-    zonebar = f"""
+    return f"""
     <div class="zonebar">
-      <span class="pin" style="left:{pos_pct(bias):.1f}%">▼</span>
-      <span class="cur" style="left:{pos_pct(bias):.1f}%">{bias:+.2f}%</span>
+      <span class="pin" style="left:{p:.1f}%">▼</span>
+      <span class="cur" style="left:{p:.1f}%">{bias:+.2f}%</span>
       {ticks}
     </div>"""
 
+
+def sig_cards_html(df, sig):
     defs = [('S1', 'RSI6 顶背离'), ('S2', 'RSI6 超买回落'), ('S3', '跌破MA20确认')]
-    sigcards = ''
+    chips = {'active': '触发中', 'warm': '近期出现', 'off': '未触发'}
+    out = ''
     for key, label in defs:
         state, date = last_fire(sig[key], df)
-        state_cn = {'active': '● 触发中（近5日）', 'warm': '○ 近期出现', 'off': '— 未触发'}[state]
-        sigcards += (f'<div class="sigcard {state}"><div class="t"><span class="dot"></span>'
-                     f'{label}</div><div class="d">{state_cn} · 最近 {date}</div></div>')
-    s4_state, s4_date = last_fire(sig['S4'], df)
-    s4_now = '● 已进入观察区' if bool(sig['S4'].iloc[-1]) else '— 未处于观察区'
-    sigcards += (f'<div class="sigcard {"active" if bool(sig["S4"].iloc[-1]) else ""}">'
-                 f'<div class="t"><span class="dot"></span>中期止盈观察区</div>'
-                 f'<div class="d">{s4_now} · 最近进入 {s4_date}</div></div>')
+        out += (f'<div class="sigcard {state}">'
+                f'<div class="row"><span class="t"><span class="dot"></span>{label}</span>'
+                f'<span class="chip {state}">{chips[state]}</span></div>'
+                f'<div class="d">最近触发 <b>{date}</b></div></div>')
+    state, date = last_fire(sig['S4'], df)
+    now_on = bool(sig['S4'].iloc[-1])
+    card_state = 'active' if now_on else state
+    chip = '观察中' if now_on else chips[state]
+    out += (f'<div class="sigcard {card_state}">'
+            f'<div class="row"><span class="t"><span class="dot"></span>中期止盈观察区</span>'
+            f'<span class="chip {card_state}">{chip}</span></div>'
+            f'<div class="d">最近进入 <b>{date}</b></div></div>')
+    return out
 
+
+def table_html(df, sig):
     tail20 = df.tail(20).iloc[::-1]
     rows = ''
     for _, r in tail20.iterrows():
@@ -409,21 +560,32 @@ def section(df):
                  f"<td class=\"{'pos' if r['乖离率']>0 else 'neg'}\">{r['乖离率']:+.2f}</td>"
                  f"<td>{r['RSI6']:.0f}</td><td>{r['RSI12']:.0f}</td>"
                  f"<td>{'+'.join(fired) if fired else ''}</td></tr>")
-    table = (f'<table><tr><th>日期</th><th>收盘</th><th>乖离率%</th><th>RSI6</th>'
-             f'<th>RSI12</th><th>信号</th></tr>{rows}</table>')
+    return (f'<div class="tablewrap"><table><tr><th>日期</th><th>收盘</th>'
+            f'<th>乖离率%</th><th>RSI6</th><th>RSI12</th><th>信号</th></tr>'
+            f'{rows}</table></div>')
 
-    return (cards + zonebar +
-            '<div class="sig">' + sigcards + '</div>' +
-            '<div class="rgbtns"><span class="lab">时间范围（三图联动）：</span>'
-            '<button onclick="setRange(90)">近3月</button>'
-            '<button onclick="setRange(365)">近1年</button>'
-            '<button onclick="setRange(730)">近2年</button>'
-            '<button onclick="setRange(1825)">近5年</button>'
-            '<button onclick="setRange(0)">全部</button></div>'
-            f'<div class="chart">{fig_price(df, 500)}</div>'
-            f'<div class="chart">{fig_bias(df, 1250)}</div>'
-            f'<div class="chart">{fig_rsi(df, 250)}</div>' +
-            table)
+
+def section(df):
+    sig = compute_signals(df)
+    bias = df.iloc[-1]['乖离率']
+    return (cards_html(df) + zonebar_html(bias)
+            + '<div class="sig">' + sig_cards_html(df, sig) + '</div>'
+            + '<div class="rgbtns"><span class="lab">时间范围（三图联动）：</span>'
+              '<button data-days="90" onclick="setRange(90,this)">近3月</button>'
+              '<button data-days="365" onclick="setRange(365,this)">近1年</button>'
+              '<button data-days="730" class="active" aria-pressed="true" '
+              'onclick="setRange(730,this)">近2年</button>'
+              '<button data-days="1825" onclick="setRange(1825,this)">近5年</button>'
+              '<button data-days="0" onclick="setRange(0,this)">全部</button></div>'
+            + '<div class="hint">拖动=平移 · 双指/滚轮=缩放 · 双击图表=复位视图 · '
+              '点图例名可隐藏/显示均线（红底纹说明条目除外）</div>'
+            + '<div class="chart"><h3>价格与均线 · H20269 红利低波全收益指数</h3>'
+              '<div id="c_price" class="plot"></div></div>'
+              '<div class="chart"><h3>年线乖离率（收盘相对 MA250）</h3>'
+              '<div id="c_bias" class="plot"></div></div>'
+              '<div class="chart"><h3>RSI（Wilder 平滑，30/70 参考线）</h3>'
+              '<div id="c_rsi" class="plot"></div></div>'
+            + table_html(df, sig))
 
 
 FOOT = """
@@ -438,7 +600,7 @@ FOOT = """
 S3 破位确认：反弹情景下（90 日内乖离率曾&lt;0、10 日内曾≥+4%）收盘跌破 MA20；观察区：自年线下方反弹至 ≥+4.5%。<br>
 · 历史检验（H20269，2007–2026，18 次独立事件）：自年线下方反弹至 +4.5% 后，61% 最终先触及 +15% 卖出线，
 仅 2015-11、2022-11 两次直接回落——中期信号宜作<b>分批减仓/停止加仓</b>参考，不宜全仓了结。详见 DASHBOARD_GUIDE.md。<br>
-· 价格图中<b>红色底纹 = 收盘跌破年线（MA250）的区间</b>，见图例「跌破年线区间」。<br>
+· 价格图中<b>红色底纹 = 收盘跌破年线（MA250）的区间</b>；图例中同名条目仅为说明，点击不会隐藏底纹。<br>
 · 数据源：中证指数官网 API（H20269，收盘后更新）。本页为研究工具，不构成投资建议。
 </div>
 """
@@ -448,17 +610,30 @@ def assemble_html(idx, source_note=''):
     """把单标的指标 DataFrame 组装成完整看板 HTML（静态构建与实时渲染共用）。"""
     if idx['MA250'].iloc[-1] != idx['MA250'].iloc[-1]:  # NaN 检查
         raise RuntimeError('H20269: 最新一日 MA250 为空，数据不足')
-    global dd
     dd = idx.dropna(subset=['MA250', 'RSI6'])
     now = beijing_now()
     asof = idx['日期'].iloc[-1].strftime('%Y-%m-%d')
     note = f' · {source_note}' if source_note else ''
+    data_js = (
+        'window.__asOf=' + json.dumps(asof) + ';\n'
+        'window.__dates=' + json.dumps([d.strftime('%Y-%m-%d') for d in dd['日期']]) + ';\n'
+        'window.__seg=' + json.dumps(_below_segments(dd)) + ';\n'
+        'window.__S={close:' + _js_arr(dd['收盘'])
+        + ',ma20:' + _js_arr(dd['MA20'])
+        + ',ma60:' + _js_arr(dd['MA60'])
+        + ',ma250:' + _js_arr(dd['MA250'])
+        + ',bias:' + _js_arr(dd['乖离率'])
+        + ',rsi6:' + _js_arr(dd['RSI6'])
+        + ',rsi12:' + _js_arr(dd['RSI12'])
+        + ',rsi24:' + _js_arr(dd['RSI24']) + '};'
+    )
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>红利低波 · 每日指标看板</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='18' fill='%232c3e50'/><text x='50' y='70' font-size='54' text-anchor='middle'>📈</text></svg>">
 <style>{CSS}</style>
 <script src="{PLOTLY_JS}"></script>
 </head>
@@ -466,20 +641,11 @@ def assemble_html(idx, source_note=''):
 <div class="wrap">
 <h1>红利低波 · 每日指标看板</h1>
 <div class="meta">H20269 红利低波全收益指数 · 数据截至 {asof} 收盘 · 生成于 {now.strftime('%Y-%m-%d %H:%M')}（北京时间）{note}</div>
+<div id="stale" class="stale" hidden></div>
 {section(idx)}
 {FOOT}
 </div>
-<script>
-window.__dates = {_dates(dd)};
-window.__fitPrice = {{
-  t: window.__dates.map(function (s) {{ return new Date(s).getTime(); }}),
-  y: [{_js_arr(dd['收盘'])}, {_js_arr(dd['MA20'])}, {_js_arr(dd['MA60'])}, {_js_arr(dd['MA250'])}],
-  pad: 0.06, zero: false}};
-window.__fitBias = {{
-  t: window.__fitPrice.t,
-  y: [{_js_arr(dd['乖离率'])}],
-  pad: 0.12, zero: true}};
-</script>
+<script>{data_js}</script>
 <script>{SYNC_JS}</script>
 </body>
 </html>"""

@@ -1,0 +1,52 @@
+name: Update dashboard page
+
+# 每交易日自动重建看板：从主仓库（数据留档仓库）取最新行情 CSV，
+# 本地重建 index.html 并提交回本仓库 —— Pages 随提交自动刷新。
+# 两次 cron 分别紧跟主仓库 update-data 的 19:30 / 22:00（北京时间）两次运行，
+# 预留 GitHub 定时任务常见的排队延迟；白天手动补跑用 Run workflow。
+on:
+  schedule:
+    - cron: '35 12 * * 1-5'   # UTC 12:35 = 北京 20:35
+    - cron: '15 15 * * 1-5'   # UTC 15:15 = 北京 23:15
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-page
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch data repo (public)
+        uses: actions/checkout@v4
+        with:
+          repository: 492060059-oss/Trading-system-Devidend-low-vol
+          path: 红利低波价格走势分析程序
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install deps
+        run: pip install pandas numpy
+
+      - name: Build page
+        run: python build_dashboard.py
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore(page): auto rebuild $(date -u -d '+8 hours' '+%Y-%m-%d')"
+            git push
+          fi
