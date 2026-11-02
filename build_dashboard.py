@@ -21,20 +21,23 @@ Pages 随仓库刷新），人工只需在改了图表代码时才需要本地�
 输出：index.html（写入本目录）
 用法：python build_dashboard.py
 """
-# === 数据源定位（兼容本地副项目布局 与 GitHub Actions 布局） ===
+# === 数据源定位（本仓库自带 data/ 优先，其次兼容本地主项目布局） ===
 import os as _os
 import sys as _sys
 _HERE = _os.path.dirname(_os.path.abspath(__file__))
-# 候选 1（CI）：workflow 把数据仓库 checkout 到本目录下的同名子目录
-# 候选 2（本地）：本目录位于 红利低波_副项目/03_在线看板，数据仓库在同级的爷爷目录
+# 候选 1：本仓库 data/（上线后的正式数据源，update_data.py 负责维护）
+# 候选 2（CI 旧布局）：workflow 把主仓库 checkout 到本目录下的同名子目录
+# 候选 3（本地副项目布局）：数据仓库在同级的爷爷目录
 _ROOT = None
-for _cand in (_os.path.join(_HERE, '红利低波价格走势分析程序'),
+for _cand in (_HERE,
+              _os.path.join(_HERE, '红利低波价格走势分析程序'),
               _os.path.abspath(_os.path.join(_HERE, '..', '..', '红利低波价格走势分析程序'))):
-    if _os.path.isdir(_cand):
+    if _os.path.isfile(_os.path.join(_cand, 'data', 'H20269历史数据.csv')):
         _ROOT = _cand
         break
 if _ROOT is None:
-    raise SystemExit('找不到数据目录 红利低波价格走势分析程序（本地或 CI checkout 均未就位）')
+    raise SystemExit('找不到 data/H20269历史数据.csv（本仓库或主项目均未就位）')
+DATA_CSV = _os.path.join(_ROOT, 'data', 'H20269历史数据.csv')
 for _p in (_ROOT, _HERE):
     if _p not in _sys.path:
         _sys.path.insert(0, _p)
@@ -661,7 +664,7 @@ def assemble_html(idx, source_note=''):
 
 
 def main():
-    idx = compute_indicators(pd.read_csv('data/H20269历史数据.csv', encoding='utf-8-sig'))
+    idx = compute_indicators(pd.read_csv(DATA_CSV, encoding='utf-8-sig'))
     idx['日期'] = pd.to_datetime(idx['日期'])
     html = assemble_html(idx)
     with open(OUT_PATH, 'w', encoding='utf-8') as f:
