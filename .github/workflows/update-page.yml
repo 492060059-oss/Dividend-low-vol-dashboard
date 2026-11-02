@@ -26,7 +26,7 @@ jobs:
       - name: Fetch data repo (public)
         uses: actions/checkout@v4
         with:
-          repository: 492060059-oss/Trading-system-Devidend-low-vol
+          repository: 492060059-oss/Trading-system-Dividend-low-vol
           path: 红利低波价格走势分析程序
 
       - uses: actions/setup-python@v5

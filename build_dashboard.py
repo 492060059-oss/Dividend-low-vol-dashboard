@@ -21,11 +21,20 @@ Pages 随仓库刷新），人工只需在改了图表代码时才需要本地�
 输出：index.html（写入本目录）
 用法：python build_dashboard.py
 """
-# === 数据源定位（副项目版） ===
+# === 数据源定位（兼容本地副项目布局 与 GitHub Actions 布局） ===
 import os as _os
 import sys as _sys
 _HERE = _os.path.dirname(_os.path.abspath(__file__))
-_ROOT = _os.path.abspath(_os.path.join(_HERE, '..', '..', '红利低波价格走势分析程序'))
+# 候选 1（CI）：workflow 把数据仓库 checkout 到本目录下的同名子目录
+# 候选 2（本地）：本目录位于 红利低波_副项目/03_在线看板，数据仓库在同级的爷爷目录
+_ROOT = None
+for _cand in (_os.path.join(_HERE, '红利低波价格走势分析程序'),
+              _os.path.abspath(_os.path.join(_HERE, '..', '..', '红利低波价格走势分析程序'))):
+    if _os.path.isdir(_cand):
+        _ROOT = _cand
+        break
+if _ROOT is None:
+    raise SystemExit('找不到数据目录 红利低波价格走势分析程序（本地或 CI checkout 均未就位）')
 for _p in (_ROOT, _HERE):
     if _p not in _sys.path:
         _sys.path.insert(0, _p)
